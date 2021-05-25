@@ -10,9 +10,11 @@ import logging
 import torch
 from torch.utils.mobile_optimizer import optimize_for_mobile
 import torchaudio
-from torchaudio.models.wav2vec2.utils.import_fairseq import import_fairseq_model
+from torchaudio.models.wav2vec2.utils.import_fairseq import import_fairseq_finetuned_model
 import fairseq
 import simple_ctc
+
+_LG = logging.getLogger(__name__)
 
 
 def _parse_args():
@@ -34,6 +36,10 @@ def _parse_args():
     parser.add_argument(
         '--output-path',
         help='Path to the directory, where the TorchScript-ed pipelines are saved.',
+    )
+    parser.add_argument(
+        '--test-file',
+        help='Path to a test audio file.',
     )
     parser.add_argument(
         '--debug',
@@ -70,8 +76,7 @@ class Encoder(torch.nn.Module):
         self.encoder = encoder
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        mask = torch.zeros_like(waveform)
-        result = self.encoder(waveform, mask)['encoder_out'].transpose(1, 0)
+        result, _ = self.encoder(waveform)
         return result
 
 
@@ -83,18 +88,6 @@ class Decoder(torch.nn.Module):
     def forward(self, emission: torch.Tensor) -> str:
         result = self.decoder.decode(emission)
         return ''.join(result.label_sequences[0][0]).replace('|', ' ')
-
-
-def _load_fairseq_model(input_file, data_dir=None):
-    overrides = {}
-    if data_dir:
-        overrides['data'] = data_dir
-
-    model, args, task = fairseq.checkpoint_utils.load_model_ensemble_and_task(
-        [input_file], arg_overrides=overrides
-    )
-    model = model[0]
-    return model
 
 
 def _get_decoder():
@@ -146,44 +139,47 @@ def _get_decoder():
     )
 
 
-def _quantize(model):
-    custom_module_config = {
-        'float_to_observed_custom_module_class': {
-            torch.nn.MultiheadAttention: torch.nn.quantizable.MultiheadAttention
-        },
-        'observed_to_quantized_custom_module_class': {
-            torch.nn.quantizable.MultiheadAttention: torch.nn.quantizable.MultiheadAttention
-        }
-    }
-    model.qconfig = torch.quantization.get_default_qconfig(
-        torch.backends.quantized.engine)
-    model_prepared = torch.quantization.prepare(
-        model, prepare_custom_config_dict=custom_module_config)
-    model = torch.quantization.convert(
-        model_prepared,
-        convert_custom_config_dict=custom_module_config)
-    print('Quantized:')
-    print(model)
+def _load_fairseq_model(input_file, data_dir=None):
+    overrides = {}
+    if data_dir:
+        overrides['data'] = data_dir
+
+    model, args, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task(
+        [input_file], arg_overrides=overrides
+    )
+    model = model[0]
+    return model, args
+
+
+def _get_model(model_file, dict_dir):
+    original, args = _load_fairseq_model(model_file, dict_dir)
+    model = import_fairseq_finetuned_model(original, args)
     return model
-
-
-def _get_encoder(model_file, dict_dir, quantize, debug):
-    original = _load_fairseq_model(model_file, dict_dir)
-    model = import_fairseq_model(original, debug)
-    print('Imported:')
-    print(model)
-    encoder = Encoder(model)
-    if quantize:
-        encoder = _quantize(encoder)
-    return encoder
 
 
 def _main():
     args = _parse_args()
     _init_logging(args.debug)
     loader = Loader()
-    encoder = _get_encoder(args.model_file, args.dict_dir, args.quantize, args.debug)
+    model = _get_model(args.model_file, args.dict_dir).eval()
+    encoder = Encoder(model)
     decoder = _get_decoder()
+    _LG.info(encoder)
+
+    if args.quantize:
+        _LG.info('Quantizing the model')
+        model.encoder.transformer.pos_conv_embed.__prepare_scriptable__()
+        encoder = torch.quantization.quantize_dynamic(
+            encoder, qconfig_spec={torch.nn.Linear}, dtype=torch.qint8)
+        _LG.info(encoder)
+
+    # test
+    if args.test_file:
+        _LG.info('Testing with %s', args.test_file)
+        waveform = loader(args.test_file)
+        emission = encoder(waveform)
+        transcript = decoder(emission)
+        _LG.info(transcript)
 
     torch.jit.script(loader).save(os.path.join(args.output_path, 'loader.zip'))
     torch.jit.script(decoder).save(os.path.join(args.output_path, 'decoder.zip'))

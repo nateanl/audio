@@ -30,6 +30,11 @@ def _parse_args():
         help='Path to a test audio file.',
     )
     parser.add_argument(
+        '--quantize',
+        action='store_true',
+        help='Quantize the model.',
+    )
+    parser.add_argument(
         '--debug',
         action='store_true',
         help=(
@@ -54,8 +59,8 @@ class Encoder(torch.nn.Module):
         self.encoder = encoder
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        mask = torch.zeros_like(waveform, dtype=torch.bool)
-        result = self.encoder(waveform, mask)
+        length = torch.tensor([waveform.shape[1]])
+        result, length = self.encoder(waveform, length)
         return result
 
 
@@ -69,13 +74,13 @@ class Decoder(torch.nn.Module):
         return ''.join(result.label_sequences[0][0]).replace('|', ' ')
 
 
-def _get_model(model_id, debug):
+def _get_model(model_id):
     from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
     tokenizer = Wav2Vec2Processor.from_pretrained(model_id).tokenizer
     labels = [k for k, v in sorted(tokenizer.get_vocab().items(), key=lambda kv: kv[1])]
     original = Wav2Vec2ForCTC.from_pretrained(model_id)
-    model = import_huggingface_model(original, debug)
-    return model, labels
+    model = import_huggingface_model(original)
+    return model.eval(), labels
 
 
 def _get_decoder(labels):
@@ -96,12 +101,20 @@ def _main():
     args = _parse_args()
     _init_logging(args.debug)
     _LG.info('Loading model: %s', args.model)
-    model, labels = _get_model(args.model, args.debug)
+    model, labels = _get_model(args.model)
     _LG.info('Labels: %s', labels)
     _LG.info('Building pipeline')
     loader = Loader()
     encoder = Encoder(model)
     decoder = _get_decoder(labels)
+    _LG.info(encoder)
+
+    if args.quantize:
+        _LG.info('Quantizing the model')
+        model.encoder.transformer.pos_conv_embed.__prepare_scriptable__()
+        encoder = torch.quantization.quantize_dynamic(
+            encoder, qconfig_spec={torch.nn.Linear}, dtype=torch.qint8)
+        _LG.info(encoder)
 
     # test
     if args.test_file:
