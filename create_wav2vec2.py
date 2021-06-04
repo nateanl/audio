@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 from torch import Tensor
 from torch.utils.mobile_optimizer import optimize_for_mobile
@@ -16,15 +18,20 @@ class SpeechRecognizer(torch.nn.Module):
             "R", "D", "L", "U", "M", "W", "C", "F", "G", "Y", "P", "B", "V", "K", "'", "X",
             "J", "Q", "Z"]
 
-    def forward(self, waveforms: Tensor) -> str:
+    def forward(self, waveforms: Tensor, sample_rate: Optional[int]) -> str:
         """Given a single channel speech data, return transcription.
-        
+
         Args:
             waveforms (Tensor): Speech tensor. Shape `[1, num_frames]`.
+            sample_rate (int, optional): Sampling rate of the input tensor.
+                When provided and if not 16000, the waveform will be resampled to 16000.
 
         Returns:
             str: The resulting transcript
         """
+        if sample_rate is not None and sample_rate != 16000:
+            waveforms = torchaudio.functional.resample(waveforms, float(sample_rate), 16000.)
+
         logits, _ = self.model(waveforms)  # [batch, num_seq, num_label]
         best_path = torch.argmax(logits[0], dim=-1)  # [num_seq,]
         prev = ''
@@ -58,7 +65,7 @@ scripted_model = torch.jit.script(quantized_model)
 optimized_model = optimize_for_mobile(scripted_model)
 
 # Sanity check
-waveform , _ = torchaudio.load('scent_of_a_woman_future.wav')
-print('Result:', optimized_model(waveform))
+waveform , sample_rate = torchaudio.load('scent_of_a_woman_future.wav')
+print('Result:', optimized_model(waveform, sample_rate))
 
 optimized_model.save("wav2vec2.pt")
