@@ -2,10 +2,12 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
+import random
 import torch
 import torchaudio
 from torch import Tensor
-from torch.utils.data import BatchSampler, Dataset
+from torch.utils.data import BatchSampler, Dataset, DistributedSampler
+import torch.distributed as dist
 
 
 class BucketizeBatchSampler(BatchSampler):
@@ -72,7 +74,6 @@ class BucketizeBatchSampler(BatchSampler):
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.buckets = self._get_buckets(self.lengths, num_buckets, min_len, max_len)
-        self.iter_list = []
         self._update_iter_list()
 
     def _get_buckets(self, lengths: List[int], num_buckets: int, min_len: int, max_len: int) -> Dict[int, Tensor]:
@@ -101,7 +102,10 @@ class BucketizeBatchSampler(BatchSampler):
         buckets = {k: v for k, v in sorted(buckets.items())}
         return buckets
 
-    def _update_iter_list(self) -> None:
+    def _update_iter_list(self, generator=None) -> None:
+        if self.shuffle:
+            for k in self.buckets:
+                self.buckets[k] = self.buckets[k][torch.randperm(self.buckets[k].size(0), generator=generator)]
         self.iter_list = []
         total_len = 0
         batch = []
@@ -121,36 +125,100 @@ class BucketizeBatchSampler(BatchSampler):
             self.iter_list.append(batch)
 
     def __iter__(self) -> Iterator[List[int]]:
-        if self.shuffle:
-            for k in self.buckets:
-                self.buckets[k] = self.buckets[k][torch.randperm(self.buckets[k].size(0))]
-            self._update_iter_list()
-
         return iter(self.iter_list)
 
     def __len__(self):
-        if self.batch_size or (self.max_token_count and not self.shuffle):
-            return len(self.iter_list)
+        return len(self.iter_list)
+
+
+class DistributedBatchSampler(DistributedSampler):
+    """`BucketizeBatchSampler` wrapper that distributes across each GPU.
+
+    Args:
+        batch_sampler (BucketizeBatchSampler): the initialized bucketize batch sampler.
+        num_replicas (int, optional): Number of processes participating in
+            distributed training. By default, :attr:`world_size` is retrieved from the
+            current distributed group.
+        rank (int, optional): Rank of the current process within :attr:`num_replicas`.
+            By default, :attr:`rank` is retrieved from the current distributed
+            group.
+        shuffle (bool, optional): If ``True`` (default), sampler will shuffle the
+            indices.
+        seed (int, optional): random seed used to shuffle the sampler if
+            :attr:`shuffle=True`. This number should be identical across all
+            processes in the distributed group. Default: ``0``.
+        drop_last (bool, optional): if ``True``, then the sampler will drop the
+            tail of the data to make it evenly divisible across the number of
+            replicas. If ``False``, the sampler will add extra indices to make
+            the data evenly divisible across the replicas. Default: ``False``.
+    """
+
+    def __init__(
+            self,
+            batch_sampler: BucketizeBatchSampler,
+            num_replicas: Optional[int] = None,
+            rank: Optional[int] = None,
+            shuffle: bool = True,
+            seed: int = 0,
+            drop_last: bool = False,
+        ) -> None:
+        self.batch_sampler = batch_sampler
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = dist.get_rank()
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.epoch = 0
+        self.seed = seed
+        self.drop_last = drop_last
+        if shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            perm = torch.randperm(len(self.batch_sampler.iter_list), generator=g).tolist()
+            indices = [self.batch_sampler.iter_list[i] for i in perm]
+        else:
+            indices = self.batch_sampler.iter_list
+        if self.drop_last:
+            self.total_size = len(indices) - len(indices) % self.num_replicas
+        else:
+            padding_size = self.num_replicas  - len(indices) % self.num_replicas
+            indices += indices[:padding_size]
+            self.total_size = len(indices)
+        self.num_samples = self.total_size // self.num_replicas
+        self.subset = indices[self.rank:self.total_size:self.num_replicas]
+        assert len(self.subset) == self.num_samples
+
+    def __iter__(self):
+        return iter(self.subset)
+
+    def __len__(self):
+        return self.total_size // self.num_replicas
 
 
 class HuBERTDataSet(Dataset):
     """Create a Dataset for HuBERT model training and fine-tuning.
 
     Args:
-        exp_dir (str or Path): The root directory of the ``.tsv`` file list.
+        root_dir (str or Path): The root directory that contains ``tsv`` and ``label`` directories.
         dataset (str): The dataset for training. Options: [``librispeech``, ``librilight``].
         subset (str): The subset of the dataset. Options: [``train``, ``valid``].
     """
 
     def __init__(
         self,
-        exp_dir: Union[str, Path],
+        root_dir: Union[str, Path],
         dataset: str,
         subset: str,
     ) -> None:
-        self.exp_dir = Path(exp_dir)
-        tsv_dir = self.exp_dir / "tsv"
-        label_dir = self.exp_dir / "label"
+        self.root_dir = Path(root_dir)
+        tsv_dir = self.root_dir / "tsv"
+        label_dir = self.root_dir / "label"
         f_list, ind_list, len_list = self._get_lists(tsv_dir, dataset, subset)
         self.f_list, self.ind_list, self.len_list = f_list, ind_list, len_list
         self.labels = self._load_labels(label_dir, dataset, subset)
@@ -250,7 +318,7 @@ class CollateFnHubert:
         self.pad = pad
         self.rand_crop = rand_crop
 
-    def __call__(self, batch: Tuple[Tensor, Tensor, int]) -> Tuple[Tensor, Tensor, Tensor]:
+    def __call__(self, batch: List[Tuple[Tensor, Tensor, int]]) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Args:
             batch (List[Tuple(Tensor, Tensor, int)]):
@@ -276,13 +344,14 @@ class CollateFnHubert:
             waveforms.append(waveform)
             lengths.append(length)
             labels.append(label)
-
-        data = torch.zeros(len(batch), audio_size)
-        for i in range(len(waveforms)):
-            data[i][0 : waveforms[i].shape[1]] = waveforms[i][0]
+        if self.pad:
+            waveforms = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
+            labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True)
+        else:
+            waveforms = torch.stack(waveforms)
+            labels = torch.stack(labels)
         lengths = torch.tensor(lengths)
-        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True)
-        return data, labels, lengths
+        return waveforms, labels, lengths
 
     def _collate_audio_label(
         self,
@@ -309,14 +378,20 @@ class CollateFnHubert:
         kernel_size = 25
         stride = 20
         sample_rate = 16  # 16 per millisecond
-        if waveform.shape[1] > audio_size:
-            diff = waveform.size(1) - audio_size
+        audio_start = 0
+        waveform = waveform[0]
+        if waveform.shape[0] > audio_size:
+            diff = waveform.size(0) - audio_size
             audio_start = torch.randint(diff, size=(1,)) if rand_crop else 0
-            label_start = torch.div(
-                audio_start - kernel_size * sample_rate, stride * sample_rate, rounding_mode="floor"
-            )
-            label_size = torch.div(audio_size - kernel_size * sample_rate, stride * sample_rate, rounding_mode="floor")
-            waveform = waveform[:, audio_start : audio_start + audio_size]
-            label = label[label_start : label_start + label_size]
-            length = audio_size
+        else:
+            audio_size = waveform.shape[0]
+        label_start = torch.max(
+            torch.div(audio_start - kernel_size * sample_rate, stride * sample_rate, rounding_mode="floor") + 1,
+            torch.tensor([0]),
+        )
+        label_size = torch.div(audio_size - kernel_size * sample_rate, stride * sample_rate, rounding_mode="floor") + 1
+        waveform = waveform[audio_start : audio_start + audio_size]
+        label = label[label_start : label_start + label_size]
+        length = audio_size
+
         return waveform, label, length
